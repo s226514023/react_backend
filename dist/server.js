@@ -1,0 +1,417 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const cors_1 = __importDefault(require("cors"));
+const dotenv_1 = __importDefault(require("dotenv"));
+const express_1 = __importDefault(require("express"));
+const app_1 = require("firebase-admin/app");
+const auth_1 = require("firebase-admin/auth");
+const firestore_1 = require("firebase-admin/firestore");
+const mail_1 = __importDefault(require("@sendgrid/mail"));
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const zod_1 = require("zod");
+dotenv_1.default.config();
+const app = (0, express_1.default)();
+const PORT = Number(process.env.PORT ?? 3000);
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const SENDER_MAIL = process.env.SENDGRID_FROM_EMAIL ?? process.env.SENDER_MAIL;
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY ?? process.env.VITE_FIREBASE_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = '1h';
+function initialiseFirebase() {
+    if ((0, app_1.getApps)().length > 0)
+        return (0, app_1.getApps)()[0];
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (serviceAccountJson) {
+        return (0, app_1.initializeApp)({ credential: (0, app_1.cert)(JSON.parse(serviceAccountJson)) });
+    }
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS is required.');
+    }
+    return (0, app_1.initializeApp)({ credential: (0, app_1.applicationDefault)() });
+}
+let firebaseReady = true;
+try {
+    initialiseFirebase();
+}
+catch {
+    firebaseReady = false;
+    console.warn('Firebase Admin is not configured. Protected routes are disabled.');
+}
+const auth = firebaseReady ? (0, auth_1.getAuth)() : null;
+const db = firebaseReady ? (0, firestore_1.getFirestore)() : null;
+if (SENDGRID_API_KEY && SENDER_MAIL)
+    mail_1.default.setApiKey(SENDGRID_API_KEY);
+const registrationSchema = zod_1.z.object({
+    firstName: zod_1.z.string().trim().min(1).max(50),
+    lastName: zod_1.z.string().trim().min(1).max(50),
+    email: zod_1.z.string().email(),
+    password: zod_1.z.string().min(6).max(128),
+    confirmPassword: zod_1.z.string().min(6).max(128),
+}).refine((data) => data.password === data.confirmPassword, {
+    message: 'Passwords do not match.',
+    path: ['confirmPassword'],
+});
+const loginSchema = zod_1.z.object({
+    email: zod_1.z.string().email(),
+    password: zod_1.z.string().min(1).max(128),
+});
+const upgradeSchema = zod_1.z.object({
+    name: zod_1.z.string().trim().min(2).max(100),
+    cardNumber: zod_1.z.string().regex(/^\d{13,19}$/),
+    expiryMonth: zod_1.z.coerce.number().int().min(1).max(12),
+    expiryYear: zod_1.z.coerce.number().int().min(new Date().getFullYear()),
+    cvv: zod_1.z.string().regex(/^\d{3,4}$/),
+});
+const postSchema = zod_1.z.object({
+    type: zod_1.z.enum(['question', 'article']),
+    plan: zod_1.z.enum(['free', 'paid']),
+    title: zod_1.z.string().trim().min(3).max(200),
+    description: zod_1.z.string().trim().max(10000).nullable().optional(),
+    abstract: zod_1.z.string().trim().max(5000).nullable().optional(),
+    articleText: zod_1.z.string().trim().max(100000).nullable().optional(),
+    tags: zod_1.z.array(zod_1.z.string().trim().min(1).max(50)).max(3),
+}).superRefine((post, context) => {
+    if (post.type === 'question' && (!post.description || post.description.trim().length === 0)) {
+        context.addIssue({ code: 'custom', path: ['description'], message: 'Questions require a description.' });
+    }
+    if (post.type === 'article' && (!post.abstract || post.abstract.trim().length === 0 || !post.articleText || post.articleText.trim().length === 0)) {
+        context.addIssue({ code: 'custom', path: ['articleText'], message: 'Articles require an abstract and article text.' });
+    }
+});
+const postFilterSchema = zod_1.z.object({
+    type: zod_1.z.enum(['question', 'article']).optional(),
+    plan: zod_1.z.enum(['free', 'paid']).optional(),
+    tag: zod_1.z.string().trim().min(1).max(50).optional(),
+});
+app.use((0, cors_1.default)({ origin: process.env.FRONTEND_URL ?? true }));
+app.use(express_1.default.json());
+function requireFirebase(_req, res, next) {
+    if (!firebaseReady || !auth || !db) {
+        return res.status(503).json({ error: 'Firebase Admin is not configured on the server.' });
+    }
+    next();
+}
+async function requireAuth(req, res, next) {
+    const header = req.header('authorization');
+    const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+    if (!token || !JWT_SECRET)
+        return res.status(401).json({ error: 'A backend session token is required.' });
+    try {
+        const decoded = jsonwebtoken_1.default.verify(token, JWT_SECRET);
+        if (typeof decoded.sub !== 'string')
+            throw new Error('JWT subject is missing.');
+        req.user = { uid: decoded.sub, email: typeof decoded.email === 'string' ? decoded.email : undefined };
+        next();
+    }
+    catch {
+        return res.status(401).json({ error: 'The backend session token is invalid or expired.' });
+    }
+}
+app.get('/', (_req, res) => res.json({ message: 'DEV@Deakin backend is running.' }));
+app.get('/api/health', (_req, res) => {
+    res.json({
+        firebase: firebaseReady,
+        firebaseAuthApi: Boolean(FIREBASE_API_KEY),
+        jwt: Boolean(JWT_SECRET),
+        email: Boolean(SENDGRID_API_KEY && SENDER_MAIL),
+    });
+});
+async function saveUserProfile(uid, email, displayName, name) {
+    if (!db)
+        throw new Error('Firestore is not configured.');
+    const userRef = db.collection('users').doc(uid);
+    const existing = await userRef.get();
+    const data = {
+        uid,
+        email,
+        ...(displayName ? { displayName } : {}),
+        ...(name ?? {}),
+        ...(existing.exists ? {} : { plan: 'free', createdAt: firestore_1.Timestamp.now() }),
+        updatedAt: firestore_1.Timestamp.now(),
+    };
+    await userRef.set(data, { merge: true });
+    return { created: !existing.exists, user: { ...data, plan: existing.data()?.plan ?? data.plan } };
+}
+async function firebasePasswordRequest(action, email, password) {
+    console.log(`[firebase-auth] ${action} started`, { email });
+    if (!FIREBASE_API_KEY) {
+        console.error('[firebase-auth] FIREBASE_API_KEY is missing.');
+        throw new Error('FIREBASE_API_KEY is not configured.');
+    }
+    const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:${action}?key=${FIREBASE_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, returnSecureToken: true }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+        const firebaseCode = String(result.error?.message ?? 'AUTH_ERROR');
+        console.error(`[firebase-auth] ${action} failed`, { email, firebaseCode, status: response.status });
+        throw new Error(firebaseCode);
+    }
+    console.log(`[firebase-auth] ${action} succeeded`, { email });
+    return result;
+}
+function createSessionToken(uid, email) {
+    if (!JWT_SECRET)
+        throw new Error('JWT_SECRET is not configured.');
+    return jsonwebtoken_1.default.sign({ email }, JWT_SECRET, { subject: uid, expiresIn: JWT_EXPIRES_IN });
+}
+function authErrorMessage(error) {
+    const code = error instanceof Error ? error.message : '';
+    const messages = {
+        EMAIL_EXISTS: 'An account with this email already exists.',
+        INVALID_LOGIN_CREDENTIALS: 'The email or password is incorrect.',
+        EMAIL_NOT_FOUND: 'The email or password is incorrect.',
+        INVALID_PASSWORD: 'The email or password is incorrect.',
+        INVALID_EMAIL: 'Enter a valid email address.',
+        WEAK_PASSWORD: 'Password must be at least 6 characters.',
+    };
+    return messages[code] ?? 'Authentication request failed.';
+}
+app.post(['/api/auth/register', '/api/users/register'], requireFirebase, async (req, res) => {
+    console.log('[register] request received', {
+        email: req.body?.email ?? '[missing]',
+        hasFirstName: Boolean(req.body?.firstName),
+        hasLastName: Boolean(req.body?.lastName),
+        hasPassword: Boolean(req.body?.password),
+        hasConfirmPassword: Boolean(req.body?.confirmpassword),
+    });
+    const parsed = registrationSchema.safeParse(req.body);
+    if (!parsed.success || !db) {
+        console.warn('[register] validation/Firebase check failed', {
+            firebaseReady: Boolean(db),
+            issues: parsed.success ? [] : parsed.error.issues.map((issue) => issue.path.join('.')),
+        });
+        return res.status(400).json({ error: parsed.success ? 'Firebase server is not configured.' : 'Registration details are invalid.' });
+    }
+    try {
+        const result = await firebasePasswordRequest('signUp', parsed.data.email, parsed.data.password);
+        const displayName = `${parsed.data.firstName} ${parsed.data.lastName}`;
+        const profile = await saveUserProfile(result.localId, result.email, displayName, {
+            firstName: parsed.data.firstName,
+            lastName: parsed.data.lastName,
+        });
+        const sessionToken = createSessionToken(result.localId, result.email);
+        console.log('[register] completed', { email: result.email, profileCreated: profile.created });
+        return res.status(201).json({
+            sessionToken,
+            token: sessionToken,
+            accessToken: sessionToken,
+            user: { ...profile.user, firstName: parsed.data.firstName, lastName: parsed.data.lastName },
+        });
+    }
+    catch (error) {
+        console.error('[register] failed', { message: error instanceof Error ? error.message : 'Unknown error' });
+        return res.status(400).json({ error: authErrorMessage(error) });
+    }
+});
+app.post(['/api/auth/login', '/api/users/login'], requireFirebase, async (req, res) => {
+    console.log('[login] request received', {
+        email: req.body?.email ?? '[missing]',
+        hasPassword: Boolean(req.body?.password),
+    });
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) {
+        console.warn('[login] validation failed', {
+            issues: parsed.error.issues.map((issue) => issue.path.join('.')),
+        });
+        return res.status(400).json({ error: 'A valid email and password are required.' });
+    }
+    try {
+        const result = await firebasePasswordRequest('signInWithPassword', parsed.data.email, parsed.data.password);
+        const profile = await saveUserProfile(result.localId, result.email);
+        const sessionToken = createSessionToken(result.localId, result.email);
+        console.log('[login] completed', {
+            email: result.email,
+            plan: profile.user.plan,
+            tokenFieldsPresent: Boolean(sessionToken),
+        });
+        return res.json({
+            sessionToken,
+            token: sessionToken,
+            accessToken: sessionToken,
+            user: profile.user,
+        });
+    }
+    catch (error) {
+        console.error('[login] failed', { message: error instanceof Error ? error.message : 'Unknown error' });
+        return res.status(401).json({ error: authErrorMessage(error) });
+    }
+});
+app.post('/api/users/sync', requireFirebase, requireAuth, async (req, res) => {
+    const parsed = zod_1.z.object({
+        email: zod_1.z.string().email(),
+        displayName: zod_1.z.string().trim().min(1).max(80).optional(),
+    }).safeParse(req.body);
+    if (!parsed.success || !req.user || !db) {
+        return res.status(400).json({ error: 'A valid email and optional display name are required.' });
+    }
+    const profile = await saveUserProfile(req.user.uid, req.user.email ?? parsed.data.email, parsed.data.displayName);
+    return res.status(profile.created ? 201 : 200).json({ user: profile.user });
+});
+app.get('/api/users/me', requireFirebase, requireAuth, async (req, res) => {
+    if (!req.user || !db)
+        return res.status(401).json({ error: 'Unauthenticated request.' });
+    const snapshot = await db.collection('users').doc(req.user.uid).get();
+    const profile = snapshot.exists
+        ? snapshot.data()
+        : { uid: req.user.uid, email: req.user.email, plan: 'free' };
+    return res.json({ user: profile });
+});
+app.post('/api/posts', requireAuth, requireFirebase, async (req, res) => {
+    const parsed = postSchema.safeParse(req.body);
+    if (!parsed.success || !req.user || !db) {
+        return res.status(400).json({
+            error: 'Invalid post data.',
+            ...(parsed.success ? {} : { details: parsed.error.flatten() }),
+        });
+    }
+    try {
+        const userSnapshot = await db.collection('users').doc(req.user.uid).get();
+        const accountPlan = String(userSnapshot.data()?.plan ?? 'free').toLowerCase();
+        if (parsed.data.plan === 'paid' && accountPlan !== 'paid') {
+            return res.status(403).json({ error: 'A paid account is required to create paid posts.' });
+        }
+        const post = {
+            type: parsed.data.type,
+            plan: parsed.data.plan,
+            title: parsed.data.title,
+            description: parsed.data.type === 'question' ? parsed.data.description : null,
+            abstract: parsed.data.type === 'article' ? parsed.data.abstract : null,
+            articleText: parsed.data.type === 'article' ? parsed.data.articleText : null,
+            tags: parsed.data.tags,
+            userId: req.user.uid,
+            createdAt: firestore_1.FieldValue.serverTimestamp(),
+        };
+        const postReference = await db.collection('posts').add(post);
+        return res.status(201).json({
+            post: {
+                id: postReference.id,
+                type: post.type,
+                plan: post.plan,
+                title: post.title,
+                description: post.description,
+                abstract: post.abstract,
+                articleText: post.articleText,
+                tags: post.tags,
+                userId: post.userId,
+            },
+        });
+    }
+    catch (error) {
+        console.error('[posts] create failed', error);
+        return res.status(500).json({ error: 'Unable to save the post.' });
+    }
+});
+app.get('/api/posts', requireFirebase, async (req, res) => {
+    if (!db)
+        return res.status(503).json({ error: 'Firestore is not configured.' });
+    try {
+        let accountPlan = 'free';
+        const header = req.header('authorization');
+        const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+        if (token) {
+            if (!JWT_SECRET)
+                return res.status(401).json({ error: 'The backend session token is invalid or expired.' });
+            const decoded = jsonwebtoken_1.default.verify(token, JWT_SECRET);
+            if (typeof decoded.sub !== 'string')
+                return res.status(401).json({ error: 'The backend session token is invalid or expired.' });
+            const userSnapshot = await db.collection('users').doc(decoded.sub).get();
+            accountPlan = String(userSnapshot.data()?.plan ?? 'free').toLowerCase();
+        }
+        const filters = postFilterSchema.safeParse(req.query);
+        if (!filters.success)
+            return res.status(400).json({ error: 'Invalid post filters.' });
+        let query = db.collection('posts').where('plan', '==', 'free');
+        if (accountPlan === 'paid')
+            query = db.collection('posts');
+        if (filters.data.type)
+            query = query.where('type', '==', filters.data.type);
+        if (filters.data.plan) {
+            if (accountPlan !== 'paid' && filters.data.plan === 'paid')
+                return res.json({ posts: [] });
+            query = query.where('plan', '==', filters.data.plan);
+        }
+        const snapshot = await query.get();
+        const requestedTag = filters.data.tag?.toLowerCase();
+        const posts = snapshot.docs
+            .map((document) => {
+            const data = document.data();
+            const tags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
+            const createdAt = data.createdAt instanceof firestore_1.Timestamp ? data.createdAt.toDate().toISOString() : null;
+            return {
+                id: document.id,
+                type: data.type ?? null,
+                plan: data.plan ?? null,
+                title: data.title ?? null,
+                description: data.description ?? null,
+                abstract: data.abstract ?? null,
+                articleText: data.articleText ?? null,
+                tags,
+                createdAt,
+            };
+        })
+            .filter((post) => !requestedTag || post.tags.some((tag) => tag.toLowerCase() === requestedTag));
+        posts.sort((left, right) => {
+            const leftCreatedAt = left.createdAt ? Date.parse(left.createdAt) : 0;
+            const rightCreatedAt = right.createdAt ? Date.parse(right.createdAt) : 0;
+            return rightCreatedAt - leftCreatedAt;
+        });
+        return res.json({ posts });
+    }
+    catch (error) {
+        if (error instanceof jsonwebtoken_1.default.JsonWebTokenError) {
+            return res.status(401).json({ error: 'The backend session token is invalid or expired.' });
+        }
+        console.error('[posts] list failed', error);
+        return res.status(500).json({ error: 'Unable to load posts.' });
+    }
+});
+app.post('/api/users/upgrade', requireFirebase, requireAuth, async (req, res) => {
+    const parsed = upgradeSchema.safeParse(req.body);
+    if (!parsed.success || !req.user || !db)
+        return res.status(400).json({ error: 'Invalid payment details.' });
+    const userRef = db.collection('users').doc(req.user.uid);
+    const snapshot = await userRef.get();
+    if (snapshot.data()?.plan === 'paid') {
+        return res.status(409).json({ error: 'This account is already on the paid plan.' });
+    }
+    await userRef.set({
+        plan: 'paid',
+        updatedAt: firestore_1.Timestamp.now(),
+        payment: { cardholderName: parsed.data.name, last4: parsed.data.cardNumber.slice(-4) },
+    }, { merge: true });
+    return res.json({ message: 'Plan upgraded successfully.', plan: 'paid' });
+});
+app.post('/subscribe', async (req, res) => {
+    const parsedBody = zod_1.z.object({
+        email: zod_1.z.string().email().optional(),
+        emailAddress: zod_1.z.string().email().optional(),
+    }).safeParse(req.body ?? {});
+    const email = parsedBody.success ? (parsedBody.data.email ?? parsedBody.data.emailAddress) : undefined;
+    if (!email)
+        return res.status(400).json({ error: 'A valid email is required.' });
+    if (!SENDGRID_API_KEY || !SENDER_MAIL) {
+        return res.status(503).json({ error: 'Email service is unavailable. Configure SENDGRID_API_KEY and SENDER_MAIL.' });
+    }
+    try {
+        await mail_1.default.send({
+            to: email,
+            from: SENDER_MAIL,
+            subject: 'Thanks for subscribing to our newsletter!',
+            text: 'Welcome to our newsletter. We will email you updates soon.',
+            html: '<p>Welcome to our newsletter. We will email you updates soon.</p>',
+        });
+        return res.status(202).json({ message: 'Subscription received. Welcome email sent.' });
+    }
+    catch (error) {
+        console.error('SendGrid error:', error);
+        return res.status(500).json({ error: 'Unable to send welcome email.' });
+    }
+});
+app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
+//# sourceMappingURL=server.js.map
