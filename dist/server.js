@@ -86,6 +86,9 @@ const postFilterSchema = zod_1.z.object({
     plan: zod_1.z.enum(['free', 'paid']).optional(),
     tag: zod_1.z.string().trim().min(1).max(50).optional(),
 });
+const commentSchema = zod_1.z.object({
+    content: zod_1.z.string().trim().min(1).max(5000),
+});
 app.use((0, cors_1.default)({ origin: process.env.FRONTEND_URL ?? true }));
 app.use(express_1.default.json());
 function requireFirebase(_req, res, next) {
@@ -272,10 +275,13 @@ app.post('/api/posts', requireAuth, requireFirebase, async (req, res) => {
     }
     try {
         const userSnapshot = await db.collection('users').doc(req.user.uid).get();
-        const accountPlan = String(userSnapshot.data()?.plan ?? 'free').toLowerCase();
+        const user = userSnapshot.data();
+        const accountPlan = String(user?.plan ?? 'free').toLowerCase();
         if (parsed.data.plan === 'paid' && accountPlan !== 'paid') {
             return res.status(403).json({ error: 'A paid account is required to create paid posts.' });
         }
+        const profileName = [user?.firstName, user?.lastName].filter(Boolean).join(' ');
+        const author = user?.displayName ?? user?.name ?? (profileName || req.user.email || req.user.uid);
         const post = {
             type: parsed.data.type,
             plan: parsed.data.plan,
@@ -285,6 +291,8 @@ app.post('/api/posts', requireAuth, requireFirebase, async (req, res) => {
             articleText: parsed.data.type === 'article' ? parsed.data.articleText : null,
             tags: parsed.data.tags,
             userId: req.user.uid,
+            createdBy: req.user.uid,
+            author,
             createdAt: firestore_1.FieldValue.serverTimestamp(),
         };
         const postReference = await db.collection('posts').add(post);
@@ -299,12 +307,57 @@ app.post('/api/posts', requireAuth, requireFirebase, async (req, res) => {
                 articleText: post.articleText,
                 tags: post.tags,
                 userId: post.userId,
+                createdBy: post.createdBy,
+                author: post.author,
+                comments: [],
             },
         });
     }
     catch (error) {
         console.error('[posts] create failed', error);
         return res.status(500).json({ error: 'Unable to save the post.' });
+    }
+});
+app.post('/api/posts/:postId/comments', requireAuth, requireFirebase, async (req, res) => {
+    const parsed = commentSchema.safeParse(req.body);
+    const postId = typeof req.params.postId === 'string' ? req.params.postId : undefined;
+    if (!parsed.success || !postId || !req.user || !db) {
+        return res.status(400).json({
+            error: 'Invalid comment data.',
+            ...(parsed.success ? {} : { details: parsed.error.flatten() }),
+        });
+    }
+    try {
+        const postReference = db.collection('posts').doc(postId);
+        const postSnapshot = await postReference.get();
+        if (!postSnapshot.exists)
+            return res.status(404).json({ error: 'Post not found.' });
+        const userSnapshot = await db.collection('users').doc(req.user.uid).get();
+        const user = userSnapshot.data();
+        const profileName = [user?.firstName, user?.lastName].filter(Boolean).join(' ');
+        const author = user?.displayName ?? user?.name ?? (profileName || user?.email || req.user.email || req.user.uid);
+        const createdAt = firestore_1.Timestamp.now();
+        const comment = {
+            content: parsed.data.content,
+            author,
+            userId: req.user.uid,
+            createdAt,
+        };
+        const commentReference = await postReference.collection('comments').add(comment);
+        return res.status(201).json({
+            comment: {
+                id: commentReference.id,
+                postId,
+                userId: req.user.uid,
+                content: comment.content,
+                author: comment.author,
+                createdAt: createdAt.toDate().toISOString(),
+            },
+        });
+    }
+    catch (error) {
+        console.error('[comments] create failed', error);
+        return res.status(500).json({ error: 'Unable to save the comment.' });
     }
 });
 app.get('/api/posts', requireFirebase, async (req, res) => {
@@ -338,11 +391,35 @@ app.get('/api/posts', requireFirebase, async (req, res) => {
         }
         const snapshot = await query.get();
         const requestedTag = filters.data.tag?.toLowerCase();
-        const posts = snapshot.docs
-            .map((document) => {
+        const posts = await Promise.all(snapshot.docs
+            .map(async (document) => {
             const data = document.data();
             const tags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
             const createdAt = data.createdAt instanceof firestore_1.Timestamp ? data.createdAt.toDate().toISOString() : null;
+            const authorId = data.createdBy ?? data.userId;
+            const authorSnapshot = authorId
+                ? await db.collection('users').doc(String(authorId)).get()
+                : null;
+            const user = authorSnapshot?.data();
+            const profileName = [user?.firstName, user?.lastName].filter(Boolean).join(' ');
+            const author = data.author ?? user?.displayName ?? user?.name ?? (profileName || user?.email || authorId || null);
+            const commentsSnapshot = await document.ref.collection('comments').get();
+            const comments = commentsSnapshot.docs.map((commentDocument) => {
+                const comment = commentDocument.data();
+                return {
+                    id: commentDocument.id,
+                    postId: document.id,
+                    userId: typeof comment.userId === 'string' ? comment.userId : null,
+                    content: typeof comment.content === 'string' ? comment.content : '',
+                    author: typeof comment.author === 'string' ? comment.author : null,
+                    createdAt: comment.createdAt instanceof firestore_1.Timestamp ? comment.createdAt.toDate().toISOString() : null,
+                };
+            });
+            comments.sort((left, right) => {
+                const leftCreatedAt = left.createdAt ? Date.parse(left.createdAt) : 0;
+                const rightCreatedAt = right.createdAt ? Date.parse(right.createdAt) : 0;
+                return leftCreatedAt - rightCreatedAt;
+            });
             return {
                 id: document.id,
                 type: data.type ?? null,
@@ -353,9 +430,11 @@ app.get('/api/posts', requireFirebase, async (req, res) => {
                 articleText: data.articleText ?? null,
                 tags,
                 createdAt,
+                author,
+                createdBy: authorId ?? null,
+                comments,
             };
-        })
-            .filter((post) => !requestedTag || post.tags.some((tag) => tag.toLowerCase() === requestedTag));
+        })).then((postList) => postList.filter((post) => !requestedTag || post.tags.some((tag) => tag.toLowerCase() === requestedTag)));
         posts.sort((left, right) => {
             const leftCreatedAt = left.createdAt ? Date.parse(left.createdAt) : 0;
             const rightCreatedAt = right.createdAt ? Date.parse(right.createdAt) : 0;
