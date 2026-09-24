@@ -1,93 +1,116 @@
-# backend
+# DEV@Deakin Backend
 
+This is the Express and TypeScript backend for the DEV@Deakin application. It provides authentication, Firestore-backed posts and comments, notifications, paid-plan upgrades, and newsletter subscriptions.
 
+## Stack
 
-## Getting started
+- Node.js and Express 5
+- TypeScript
+- Firebase Admin SDK and Firestore
+- Firebase Authentication REST API
+- JWT session tokens
+- Zod request validation
+- SendGrid for newsletter email
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Project structure
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```text
+src/server.ts       Main Express server, middleware, helpers, and routes
+firebase-service-account.json  Local Firebase Admin credentials
+dist/               Compiled JavaScript output after building
 ```
-cd existing_repo
-git remote add origin https://gitlab.deakin.edu.au/s226514023/backend.git
-git branch -M main
-git push -uf origin main
+
+## Requirements
+
+- Node.js with npm
+- A Firebase project with Firestore and Email/Password Authentication enabled
+- A Firebase Admin service account for local Firestore access
+
+## Configuration
+
+Create a `.env` file in this directory. The important values are:
+
+```env
+PORT=3000
+JWT_SECRET=replace-with-a-long-random-secret
+FIREBASE_API_KEY=your-firebase-web-api-key
+GOOGLE_APPLICATION_CREDENTIALS=firebase-service-account.json
+FRONTEND_URL=http://localhost:5173
+SENDGRID_API_KEY=your-sendgrid-key
+SENDER_MAIL=verified-sender@example.com
 ```
 
-## Integrate with your tools
+`FIREBASE_API_KEY` can also be provided as `VITE_FIREBASE_API_KEY`. Instead of `GOOGLE_APPLICATION_CREDENTIALS`, the backend accepts Firebase service-account JSON through `FIREBASE_SERVICE_ACCOUNT_JSON`.
 
-* [Set up project integrations](https://gitlab.deakin.edu.au/s226514023/backend/-/settings/integrations)
+Do not commit `.env`, service-account JSON, SendGrid keys, or JWT secrets. The service-account file is read by Firebase Admin and should remain local or be provided through deployment secrets.
 
-## Collaborate with your team
+## Install and run
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```bash
+npm install
+npm run dev
+```
 
-## Test and Deploy
+The development server runs at `http://localhost:3000` by default. For a production-style run:
 
-Use the built-in continuous integration in GitLab.
+```bash
+npm run build
+npm start
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+`npm run build` is the main compile check. There is currently no automated test suite configured, so `npm test` remains the package template command and is not a useful verification step yet.
 
-***
+## API overview
 
-# Editing this README
+### Authentication
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `POST /api/users/sync`
+- `GET /api/users/me`
 
-## Suggestions for a good README
+Login and registration return a backend JWT. Send it on protected requests as:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```http
+Authorization: Bearer <session-token>
+```
 
-## Name
-Choose a self-explaining name for your project.
+### Posts
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+- `GET /api/posts`
+- `POST /api/posts`
+- `GET /api/users/me/posts`
+- `PATCH /api/posts/:postId`
+- `DELETE /api/posts/:postId`
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Posts store both `userId` and `createdBy` for ownership compatibility. Post responses include the author and a `comments` array. Only the owner can edit or delete a post, and editing does not replace its comments.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+### Comments and notifications
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+- `POST /api/posts/:postId/comments`
+- `GET /api/notifications`
+- `PATCH /api/notifications/:notificationId/read`
+- `PATCH /api/notifications/read-all`
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Comments are stored in the Firestore subcollection `posts/{postId}/comments`. A reply may include `parentCommentId`. Commenting on a post creates a notification for the post owner; replying creates a `comment_reply` notification for the parent commenter.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Other routes
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+- `GET /api/health` reports Firebase, JWT, and email configuration status.
+- `POST /api/users/upgrade` validates upgrade details and records the paid plan.
+- `POST /subscribe` sends a newsletter welcome email through SendGrid.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Firestore collections
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+- `users/{uid}` stores account profile and plan information.
+- `posts/{postId}` stores post content and ownership metadata.
+- `posts/{postId}/comments/{commentId}` stores comments and replies.
+- `notifications/{notificationId}` stores recipient-scoped notification records.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+The backend uses Firestore timestamps internally and converts them to ISO strings in API responses.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## Notes
 
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- Firebase Admin configuration is optional at process startup so `/` and `/api/health` can still respond when local credentials are missing. Protected routes return `503` until Firebase is configured.
+- The post feed currently performs tag/type/plan filtering in Firestore and leaves free-text search to the frontend.
+- Notifications are loaded through REST polling. WebSockets are not required for the current frontend flow.

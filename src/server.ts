@@ -11,6 +11,7 @@ import { z } from 'zod';
 
 dotenv.config();
 
+// Basic Express app and environment configuration.
 const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
@@ -19,6 +20,7 @@ const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY ?? process.env.VITE_FIREBA
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = '1h';
 
+// Initialise Firebase Admin once, using either JSON credentials or ADC.
 function initialiseFirebase() {
   if (getApps().length > 0) return getApps()[0];
 
@@ -34,6 +36,7 @@ function initialiseFirebase() {
   return initializeApp({ credential: applicationDefault() });
 }
 
+// Keep the server available for public health checks if Firebase is unavailable.
 let firebaseReady = true;
 try {
   initialiseFirebase();
@@ -49,6 +52,7 @@ if (SENDGRID_API_KEY && SENDER_MAIL) sgMail.setApiKey(SENDGRID_API_KEY);
 
 type AuthenticatedRequest = Request & { user?: { uid: string; email?: string } };
 
+// Request validation schemas keep bad data out of Firestore.
 const registrationSchema = z.object({
   firstName: z.string().trim().min(1).max(50),
   lastName: z.string().trim().min(1).max(50),
@@ -98,11 +102,23 @@ const postFilterSchema = z.object({
 
 const commentSchema = z.object({
   content: z.string().trim().min(1).max(5000),
+  parentCommentId: z.string().trim().min(1).max(200).nullable().optional(),
+});
+
+const postUpdateSchema = z.object({
+  type: z.enum(['question', 'article']).optional(),
+  plan: z.enum(['free', 'paid']).optional(),
+  title: z.string().trim().min(3).max(200).optional(),
+  description: z.string().trim().max(10000).nullable().optional(),
+  abstract: z.string().trim().max(5000).nullable().optional(),
+  articleText: z.string().trim().max(100000).nullable().optional(),
+  tags: z.array(z.string().trim().min(1).max(50)).max(3).optional(),
 });
 
 app.use(cors({ origin: process.env.FRONTEND_URL ?? true }));
 app.use(express.json());
 
+// Reject protected requests when Firebase is not configured.
 function requireFirebase(_req: Request, res: Response, next: NextFunction) {
   if (!firebaseReady || !auth || !db) {
     return res.status(503).json({ error: 'Firebase Admin is not configured on the server.' });
@@ -110,6 +126,7 @@ function requireFirebase(_req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+// Verify the backend JWT and attach the user ID to the request.
 async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const header = req.header('authorization');
   const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
@@ -137,6 +154,7 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+// Create or update the Firestore profile used by the rest of the API.
 async function saveUserProfile(
   uid: string,
   email: string,
@@ -159,6 +177,7 @@ async function saveUserProfile(
   return { created: !existing.exists, user: { ...data, plan: existing.data()?.plan ?? data.plan } };
 }
 
+// Use Firebase Auth REST endpoints for email/password authentication.
 async function firebasePasswordRequest(action: 'signUp' | 'signInWithPassword', email: string, password: string) {
   console.log(`[firebase-auth] ${action} started`, { email });
   if (!FIREBASE_API_KEY) {
@@ -184,11 +203,13 @@ async function firebasePasswordRequest(action: 'signUp' | 'signInWithPassword', 
   return result as { localId: string; email: string; idToken: string; refreshToken: string; expiresIn: string };
 }
 
+// Create the short-lived token used by protected backend routes.
 function createSessionToken(uid: string, email: string) {
   if (!JWT_SECRET) throw new Error('JWT_SECRET is not configured.');
   return jwt.sign({ email }, JWT_SECRET, { subject: uid, expiresIn: JWT_EXPIRES_IN });
 }
 
+// Convert Firebase auth error codes into messages suitable for the frontend.
 function authErrorMessage(error: unknown) {
   const code = error instanceof Error ? error.message : '';
   const messages: Record<string, string> = {
@@ -202,6 +223,7 @@ function authErrorMessage(error: unknown) {
   return messages[code] ?? 'Authentication request failed.';
 }
 
+// Authentication routes.
 app.post(['/api/auth/register', '/api/users/register'], requireFirebase, async (req, res) => {
   console.log('[register] request received', {
     email: req.body?.email ?? '[missing]',
@@ -296,6 +318,7 @@ app.get('/api/users/me', requireFirebase, requireAuth, async (req: Authenticated
   return res.json({ user: profile });
 });
 
+// Create posts and save their ownership metadata.
 app.post('/api/posts', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
   const parsed = postSchema.safeParse(req.body);
   if (!parsed.success || !req.user || !db) {
@@ -351,6 +374,208 @@ app.post('/api/posts', requireAuth, requireFirebase, async (req: AuthenticatedRe
   }
 });
 
+// Return posts owned by the current user, including their comments.
+app.get('/api/users/me/posts', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
+  if (!req.user || !db) return res.status(401).json({ error: 'Unauthenticated request.' });
+
+  try {
+    const [userIdSnapshot, createdBySnapshot] = await Promise.all([
+      db.collection('posts').where('userId', '==', req.user.uid).get(),
+      db.collection('posts').where('createdBy', '==', req.user.uid).get(),
+    ]);
+    const documents = new Map(userIdSnapshot.docs.map((document) => [document.id, document]));
+    createdBySnapshot.docs.forEach((document) => documents.set(document.id, document));
+    const posts = await Promise.all(Array.from(documents.values()).map(async (document) => {
+      const data = document.data();
+      const commentsSnapshot = await document.ref.collection('comments').get();
+      const comments = commentsSnapshot.docs.map((commentDocument) => {
+        const comment = commentDocument.data();
+        return {
+          id: commentDocument.id,
+          postId: document.id,
+          userId: typeof comment.userId === 'string' ? comment.userId : null,
+          parentCommentId: typeof comment.parentCommentId === 'string' ? comment.parentCommentId : null,
+          content: typeof comment.content === 'string' ? comment.content : '',
+          author: typeof comment.author === 'string' ? comment.author : null,
+          createdAt: comment.createdAt instanceof Timestamp ? comment.createdAt.toDate().toISOString() : null,
+        };
+      });
+      const createdAt = data.createdAt instanceof Timestamp ? data.createdAt.toDate().toISOString() : null;
+      return {
+        id: document.id,
+        type: data.type ?? null,
+        plan: data.plan ?? null,
+        title: data.title ?? null,
+        description: data.description ?? null,
+        abstract: data.abstract ?? null,
+        articleText: data.articleText ?? null,
+        tags: Array.isArray(data.tags) ? data.tags : [],
+        author: data.author ?? null,
+        createdBy: data.createdBy ?? data.userId ?? null,
+        createdAt,
+        comments,
+      };
+    }));
+    posts.sort((left, right) => Date.parse(right.createdAt ?? '') - Date.parse(left.createdAt ?? ''));
+    return res.json({ posts });
+  } catch (error) {
+    console.error('[posts] own list failed', error);
+    return res.status(500).json({ error: 'Unable to load your posts.' });
+  }
+});
+
+// Update an owned post without replacing its comments subcollection.
+app.patch('/api/posts/:postId', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
+  const parsed = postUpdateSchema.safeParse(req.body);
+  const postId = typeof req.params.postId === 'string' ? req.params.postId : undefined;
+  if (!parsed.success || !postId || !req.user || !db) {
+    return res.status(400).json({
+      error: 'Invalid post data.',
+      ...(parsed.success ? {} : { details: parsed.error.flatten() }),
+    });
+  }
+
+  try {
+    const postReference = db.collection('posts').doc(postId);
+    const postSnapshot = await postReference.get();
+    if (!postSnapshot.exists) return res.status(404).json({ error: 'Post not found.' });
+
+    const existing = postSnapshot.data() ?? {};
+    const ownerId = existing.userId ?? existing.createdBy;
+    if (ownerId !== req.user.uid) return res.status(403).json({ error: 'You do not own this post.' });
+
+    if (parsed.data.plan === 'paid') {
+      const userSnapshot = await db.collection('users').doc(req.user.uid).get();
+      if (String(userSnapshot.data()?.plan ?? 'free').toLowerCase() !== 'paid') {
+        return res.status(403).json({ error: 'A paid account is required for paid posts.' });
+      }
+    }
+
+    const updates = Object.fromEntries(Object.entries(parsed.data).filter(([, value]) => value !== undefined));
+    if (updates.type === 'question') {
+      updates.abstract = null;
+      updates.articleText = null;
+    } else if (updates.type === 'article') {
+      updates.description = null;
+    }
+    await postReference.update(updates);
+    const updated = { ...existing, ...updates };
+    const commentsSnapshot = await postReference.collection('comments').get();
+    const comments = commentsSnapshot.docs.map((commentDocument) => {
+      const comment = commentDocument.data();
+      return {
+        id: commentDocument.id,
+        postId,
+        userId: typeof comment.userId === 'string' ? comment.userId : null,
+        parentCommentId: typeof comment.parentCommentId === 'string' ? comment.parentCommentId : null,
+        content: typeof comment.content === 'string' ? comment.content : '',
+        author: typeof comment.author === 'string' ? comment.author : null,
+        createdAt: comment.createdAt instanceof Timestamp ? comment.createdAt.toDate().toISOString() : null,
+      };
+    });
+    return res.json({
+      post: {
+        id: postId,
+        title: updated.title ?? null,
+        type: updated.type ?? null,
+        plan: updated.plan ?? null,
+        description: updated.description ?? null,
+        abstract: updated.abstract ?? null,
+        articleText: updated.articleText ?? null,
+        tags: updated.tags ?? [],
+        author: updated.author ?? null,
+        createdBy: updated.createdBy ?? updated.userId ?? null,
+        comments,
+      },
+    });
+  } catch (error) {
+    console.error('[posts] update failed', error);
+    return res.status(500).json({ error: 'Unable to update the post.' });
+  }
+});
+
+// Notification routes are scoped to the authenticated recipient.
+app.get('/api/notifications', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
+  if (!req.user || !db) return res.status(401).json({ error: 'Unauthenticated request.' });
+
+  try {
+    const snapshot = await db.collection('notifications').where('recipientId', '==', req.user.uid).get();
+    const notifications = snapshot.docs.map((document) => {
+      const data = document.data();
+      return {
+        id: document.id,
+        type: data.type ?? null,
+        message: data.message ?? null,
+        postId: data.postId ?? null,
+        commentId: data.commentId ?? null,
+        read: data.read === true,
+        createdAt: data.createdAt instanceof Timestamp ? data.createdAt.toDate().toISOString() : null,
+      };
+    });
+    notifications.sort((left, right) => Date.parse(right.createdAt ?? '') - Date.parse(left.createdAt ?? ''));
+    return res.json({ notifications });
+  } catch (error) {
+    console.error('[notifications] list failed', error);
+    return res.status(500).json({ error: 'Unable to load notifications.' });
+  }
+});
+
+app.patch('/api/notifications/:notificationId/read', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
+  const notificationId = typeof req.params.notificationId === 'string' ? req.params.notificationId : undefined;
+  if (!notificationId || !req.user || !db) return res.status(400).json({ error: 'A valid notification ID is required.' });
+
+  try {
+    const notificationReference = db.collection('notifications').doc(notificationId);
+    const snapshot = await notificationReference.get();
+    if (!snapshot.exists || snapshot.data()?.recipientId !== req.user.uid) {
+      return res.status(404).json({ error: 'Notification not found.' });
+    }
+    await notificationReference.update({ read: true });
+    return res.json({ notification: { id: notificationId, read: true } });
+  } catch (error) {
+    console.error('[notifications] mark read failed', error);
+    return res.status(500).json({ error: 'Unable to mark notification as read.' });
+  }
+});
+
+app.patch('/api/notifications/read-all', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
+  if (!req.user || !db) return res.status(401).json({ error: 'Unauthenticated request.' });
+
+  try {
+    const snapshot = await db.collection('notifications').where('recipientId', '==', req.user.uid).get();
+    if (snapshot.empty) return res.json({ updated: 0 });
+    const batch = db.batch();
+    snapshot.docs.forEach((document) => batch.update(document.ref, { read: true }));
+    await batch.commit();
+    return res.json({ updated: snapshot.size });
+  } catch (error) {
+    console.error('[notifications] mark all read failed', error);
+    return res.status(500).json({ error: 'Unable to mark notifications as read.' });
+  }
+});
+
+app.delete('/api/posts/:postId', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res: Response) => {
+  const postId = typeof req.params.postId === 'string' ? req.params.postId : undefined;
+  if (!postId || !req.user || !db) return res.status(400).json({ error: 'A valid post ID is required.' });
+
+  try {
+    const postReference = db.collection('posts').doc(postId);
+    const postSnapshot = await postReference.get();
+    if (!postSnapshot.exists) return res.status(404).json({ error: 'Post not found.' });
+    const existing = postSnapshot.data() ?? {};
+    if ((existing.userId ?? existing.createdBy) !== req.user.uid) {
+      return res.status(403).json({ error: 'You do not own this post.' });
+    }
+
+    await postReference.delete();
+    return res.json({ message: 'Post deleted successfully.' });
+  } catch (error) {
+    console.error('[posts] delete failed', error);
+    return res.status(500).json({ error: 'Unable to delete the post.' });
+  }
+});
+
+// Add a comment or reply and create the matching notification.
 app.post('/api/posts/:postId/comments', requireAuth, requireFirebase, async (req: AuthenticatedRequest, res) => {
   const parsed = commentSchema.safeParse(req.body);
   const postId = typeof req.params.postId === 'string' ? req.params.postId : undefined;
@@ -366,6 +591,15 @@ app.post('/api/posts/:postId/comments', requireAuth, requireFirebase, async (req
     const postSnapshot = await postReference.get();
     if (!postSnapshot.exists) return res.status(404).json({ error: 'Post not found.' });
 
+    const parentCommentId = parsed.data.parentCommentId ?? null;
+    let parentCommentUserId: string | undefined;
+    if (parentCommentId) {
+      const parentSnapshot = await postReference.collection('comments').doc(parentCommentId).get();
+      if (!parentSnapshot.exists) return res.status(404).json({ error: 'Parent comment not found.' });
+      const parentUserId = parentSnapshot.data()?.userId;
+      parentCommentUserId = typeof parentUserId === 'string' ? parentUserId : undefined;
+    }
+
     const userSnapshot = await db.collection('users').doc(req.user.uid).get();
     const user = userSnapshot.data();
     const profileName = [user?.firstName, user?.lastName].filter(Boolean).join(' ');
@@ -375,15 +609,32 @@ app.post('/api/posts/:postId/comments', requireAuth, requireFirebase, async (req
       content: parsed.data.content,
       author,
       userId: req.user.uid,
+      parentCommentId,
       createdAt,
     };
     const commentReference = await postReference.collection('comments').add(comment);
+
+    const postOwnerId = postSnapshot.data()?.userId ?? postSnapshot.data()?.createdBy;
+    const recipientId = parentCommentUserId ?? (typeof postOwnerId === 'string' ? postOwnerId : undefined);
+    if (recipientId && recipientId !== req.user.uid) {
+      const notificationType = parentCommentId ? 'comment_reply' : 'comment';
+      await db.collection('notifications').add({
+        recipientId,
+        type: notificationType,
+        message: parentCommentId ? 'Someone replied to your comment.' : 'Someone commented on your post.',
+        postId,
+        commentId: commentReference.id,
+        read: false,
+        createdAt,
+      });
+    }
 
     return res.status(201).json({
       comment: {
         id: commentReference.id,
         postId,
         userId: req.user.uid,
+        parentCommentId,
         content: comment.content,
         author: comment.author,
         createdAt: createdAt.toDate().toISOString(),
@@ -395,6 +646,7 @@ app.post('/api/posts/:postId/comments', requireAuth, requireFirebase, async (req
   }
 });
 
+// Public post feed; paid posts require a paid authenticated account.
 app.get('/api/posts', requireFirebase, async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Firestore is not configured.' });
 
@@ -442,6 +694,7 @@ app.get('/api/posts', requireFirebase, async (req, res) => {
             id: commentDocument.id,
             postId: document.id,
             userId: typeof comment.userId === 'string' ? comment.userId : null,
+            parentCommentId: typeof comment.parentCommentId === 'string' ? comment.parentCommentId : null,
             content: typeof comment.content === 'string' ? comment.content : '',
             author: typeof comment.author === 'string' ? comment.author : null,
             createdAt: comment.createdAt instanceof Timestamp ? comment.createdAt.toDate().toISOString() : null,
@@ -483,6 +736,7 @@ app.get('/api/posts', requireFirebase, async (req, res) => {
   }
 });
 
+// Record a validated upgrade and the last four card digits.
 app.post('/api/users/upgrade', requireFirebase, requireAuth, async (req: AuthenticatedRequest, res) => {
   const parsed = upgradeSchema.safeParse(req.body);
   if (!parsed.success || !req.user || !db) return res.status(400).json({ error: 'Invalid payment details.' });
@@ -502,6 +756,7 @@ app.post('/api/users/upgrade', requireFirebase, requireAuth, async (req: Authent
   return res.json({ message: 'Plan upgraded successfully.', plan: 'paid' });
 });
 
+// Send the newsletter welcome email through SendGrid.
 app.post('/subscribe', async (req, res) => {
   const parsedBody = z.object({
     email: z.string().email().optional(),
@@ -530,4 +785,5 @@ app.post('/subscribe', async (req, res) => {
   }
 });
 
+// Start the HTTP server after all routes have been registered.
 app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
